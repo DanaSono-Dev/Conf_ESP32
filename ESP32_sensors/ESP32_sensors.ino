@@ -1,7 +1,6 @@
 // Monitor de cultivo de jitomate — ESP32
-// FreeRTOS + WiFi + MQTT + MQ-135 ppm + 2 zonas de riego
+// FreeRTOS + WiFi + MQTT + 2 zonas independientes (DHT11, MQ-135, suelo, válvula)
 
-// Importaciones
 #include <Arduino.h>
 #include "DHT.h"
 #include <WiFi.h>
@@ -9,38 +8,41 @@
 #include <MQUnifiedsensor.h>
 
 // WiFi y MQTT
-#define WIFI_SSID          "SRAI"
-#define WIFI_PASSWORD      "SRAI_E310"
+#define WIFI_SSID       "SRAI"
+#define WIFI_PASSWORD   "SRAI_E310"
 
-#define MQTT_BROKER        "10.42.0.1"
-#define MQTT_PORT          1883
-#define MQTT_CLIENT_ID     "ESP32_zona_1"
-#define MQTT_USER          ""
-#define MQTT_PASSWORD      ""
+#define MQTT_BROKER     "10.42.0.1"
+#define MQTT_PORT       1883
+#define MQTT_CLIENT_ID  "ESP32_1"
+#define MQTT_USER       ""
+#define MQTT_PASSWORD   ""
 
 // Tópicos MQTT
 String TOPIC_ALERTAS;
 String TOPIC_ESTADO;
 
-// Pines — sensores
-#define DHTPIN             4
-#define DHTTYPE            DHT11
-#define PIN_SUELO_Z1       34
-#define PIN_SUELO_Z2       35
-#define PIN_MQ135          32
+// Pines — zona 1
+#define DHTPIN_Z1       4
+#define PIN_MQ135_Z1    32
+#define PIN_SUELO_Z1    34
+#define PIN_VALVULA_Z1  26
+#define DHTTYPE_Z1         DHT11
 
-// Pines — relés
-#define PIN_VALVULA_1      25
-#define PIN_VALVULA_2      26
+// Pines — zona 2
+#define DHTPIN_Z2       16
+#define PIN_MQ135_Z2    33
+#define PIN_SUELO_Z2    35
+#define PIN_VALVULA_Z2  27
+#define DHTTYPE_Z2         DHT22
 
 // Parámetros de cultivo — DHT11
-const float TEMP_OPT_MIN    = 22.0;
-const float TEMP_OPT_MAX    = 28.0;
-const float TEMP_CRITICA     = 35.0;
+const float TEMP_OPT_MIN     = 22.0;
+const float TEMP_OPT_MAX     = 28.0;
+const float TEMP_CRITICA      = 35.0;
 
-const float HUM_AMB_OPT_MIN = 60.0;
-const float HUM_AMB_OPT_MAX = 80.0;
-const float HUM_AMB_CRITICA  = 90.0;
+const float HUM_AMB_OPT_MIN  = 60.0;
+const float HUM_AMB_OPT_MAX  = 80.0;
+const float HUM_AMB_CRITICA   = 90.0;
 
 // Parámetros de cultivo — suelo
 const int SUELO_RIEGO_MIN    = 60;
@@ -51,39 +53,40 @@ const int SUELO_VALOR_SECO   = 2389;
 const int SUELO_VALOR_HUMEDO = 352;
 
 // Parámetros de cultivo — MQ-135
-const float CO2_OPTIMO      = 1200.0;
-const float CO2_ADVERTENCIA = 2000.0;
-const float CO2_CRITICO     = 5000.0;
+const float CO2_OPTIMO       = 1200.0;
+const float CO2_ADVERTENCIA  = 2000.0;
+const float CO2_CRITICO      = 5000.0;
 
 // MQ-135
-#define MQ135_BOARD        "ESP32"
-#define MQ135_VOLTAJE      3.3
-#define MQ135_RL           10.0
-#define MQ135_MUESTRAS_CAL 100
-#define MQ135_RATIO_AIRE   3.6
+#define MQ135_BOARD         "ESP32"
+#define MQ135_VOLTAJE       3.3
+#define MQ135_RL            10.0
+#define MQ135_MUESTRAS_CAL  100
+#define MQ135_RATIO_AIRE    3.6
 
-// Muestras ADC suelo
-#define ADC_MUESTRAS       16
+// ADC
+#define ADC_MUESTRAS        16
 
 // Intervalos de tareas
 #define INTERVALO_SENSORES_MS  60000
 #define INTERVALO_MQTT_MS      60000
 
 // Objetos globales
-DHT          dht(DHTPIN, DHTTYPE);
+DHT dht1(DHTPIN_Z1, DHTTYPE_Z1);
+DHT dht2(DHTPIN_Z2, DHTTYPE_Z2);
+
 WiFiClient   wifiClient;
 PubSubClient mqttClient(wifiClient);
 
-MQUnifiedsensor mq135(MQ135_BOARD, MQ135_VOLTAJE, 12, PIN_MQ135, "MQ-135");
+MQUnifiedsensor mq135_z1(MQ135_BOARD, MQ135_VOLTAJE, 12, PIN_MQ135_Z1, "MQ-135");
+MQUnifiedsensor mq135_z2(MQ135_BOARD, MQ135_VOLTAJE, 12, PIN_MQ135_Z2, "MQ-135");
 
-// Estructura compartida entre tareas
-struct DatosSensores {
+// Datos por zona
+struct DatosZona {
   float temperatura;
   float humedadAmbiente;
-  int   humedadSueloZ1;
-  int   humedadSueloZ2;
-  bool  valvulaZ1;
-  bool  valvulaZ2;
+  int   humedadSuelo;
+  bool  valvula;
   float ppmCO2;
   float ppmCO;
   float ppmNH3;
@@ -94,7 +97,9 @@ struct DatosSensores {
   bool  valido;
 };
 
-DatosSensores     datosSensores;
+DatosZona datoZ1;
+DatosZona datoZ2;
+
 SemaphoreHandle_t xMutexDatos;
 
 // Handles FreeRTOS
@@ -103,49 +108,77 @@ TaskHandle_t hTareaMQTT     = NULL;
 
 // Prototipos
 void   iniciarTopicos();
+void   calibrarMQ135(MQUnifiedsensor &sensor, const char *etiqueta);
+void   leerMQ135(MQUnifiedsensor &sensor, DatosZona &zona);
+int    leerSueloPromedio(int pin, int muestras);
 void   tareaLecturaSensores(void *pvParameters);
 void   tareaMQTT(void *pvParameters);
 void   conectarWiFi();
 void   conectarMQTT();
-void   calibrarMQ135();
-int    leerSueloPromedio(int pin, int muestras);
-String evaluarTemperatura(float t);
-String evaluarHumedadAmbiente(float h);
+String evaluarTemperatura(float t, int zona);
+String evaluarHumedadAmbiente(float h, int zona);
 String evaluarHumedadSuelo(int s, int zona);
-String evaluarCalidadAire(float co2ppm);
-String construirJSON(const DatosSensores &d);
+String evaluarCalidadAire(float co2ppm, int zona);
+String construirJSONZona(const DatosZona &d, int zona);
+String construirJSONCompleto(const DatosZona &z1, const DatosZona &z2);
 
-// Construcción de tópicos
+// Tópicos
 void iniciarTopicos() {
   String base   = String("invernadero/jitomate/") + MQTT_CLIENT_ID;
   TOPIC_ALERTAS = base + "/alertas";
   TOPIC_ESTADO  = base + "/estado";
 }
 
-// Calibración R0 del MQ-135
-void calibrarMQ135() {
-  Serial.println("Calibrando MQ-135 en aire limpio...");
+// Calibración R0 — recibe el sensor por referencia
+void calibrarMQ135(MQUnifiedsensor &sensor, const char *etiqueta) {
+  Serial.printf("Calibrando %s en aire limpio...\n", etiqueta);
 
-  mq135.setRegressionMethod(1);
-  mq135.init();
+  sensor.setRegressionMethod(1);
+  sensor.init();
 
   float r0 = 0;
   for (int i = 0; i < MQ135_MUESTRAS_CAL; i++) {
-    mq135.update();
-    r0 += mq135.calibrate(MQ135_RATIO_AIRE);
+    sensor.update();
+    r0 += sensor.calibrate(MQ135_RATIO_AIRE);
     delay(10);
   }
   r0 /= MQ135_MUESTRAS_CAL;
 
-  mq135.setR0(r0);
-  Serial.printf("R0 calculado: %.2f kOhm\n", r0);
+  sensor.setR0(r0);
+  Serial.printf("R0 %s: %.2f kOhm\n", etiqueta, r0);
 
   if (r0 < 1.0 || r0 > 100.0) {
-    Serial.println("ADVERTENCIA: R0 fuera de rango - verifica conexion del sensor");
+    Serial.printf("ADVERTENCIA: R0 fuera de rango en %s - verifica conexion\n", etiqueta);
   }
 }
 
-// Lectura promediada sensor de suelo
+// Lectura de gases MQ-135 — escribe directo en la estructura de zona
+void leerMQ135(MQUnifiedsensor &sensor, DatosZona &zona) {
+  sensor.update();
+
+  sensor.setA(110.47); sensor.setB(-2.862);
+  zona.ppmCO2     = sensor.readSensor();
+
+  sensor.setA(605.18); sensor.setB(-3.937);
+  zona.ppmCO      = sensor.readSensor();
+
+  sensor.setA(102.2);  sensor.setB(-2.473);
+  zona.ppmNH3     = sensor.readSensor();
+
+  sensor.setA(77.255); sensor.setB(-3.18);
+  zona.ppmAlcohol = sensor.readSensor();
+
+  sensor.setA(3616.1); sensor.setB(-2.675);
+  zona.ppmHumo    = sensor.readSensor();
+
+  sensor.setA(44.947); sensor.setB(-3.445);
+  zona.ppmTolueno = sensor.readSensor();
+
+  sensor.setA(34.668); sensor.setB(-3.369);
+  zona.ppmAcetona = sensor.readSensor();
+}
+
+// Lectura promediada sensor capacitivo de suelo
 int leerSueloPromedio(int pin, int muestras) {
   long suma = 0;
   for (int i = 0; i < muestras; i++) {
@@ -159,31 +192,32 @@ int leerSueloPromedio(int pin, int muestras) {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("=== Monitoreo zona 1 ===");
+  Serial.println("=== Monitoreo ESP32 1 ===");
 
   iniciarTopicos();
 
-  dht.begin();
+  dht1.begin();
+  dht2.begin();
   delay(2000);
 
-  pinMode(PIN_VALVULA_1, OUTPUT);
-  pinMode(PIN_VALVULA_2, OUTPUT);
-  digitalWrite(PIN_VALVULA_1, LOW);
-  digitalWrite(PIN_VALVULA_2, LOW);
+  pinMode(PIN_VALVULA_Z1, OUTPUT);
+  pinMode(PIN_VALVULA_Z2, OUTPUT);
+  digitalWrite(PIN_VALVULA_Z1, LOW);
+  digitalWrite(PIN_VALVULA_Z2, LOW);
 
-  calibrarMQ135();
+  // Calibración independiente por sensor
+  calibrarMQ135(mq135_z1, "MQ135-Z1");
+  calibrarMQ135(mq135_z2, "MQ135-Z2");
+
   conectarWiFi();
 
   mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+  mqttClient.setBufferSize(1024);
   mqttClient.setKeepAlive(30);
 
-  mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
-  mqttClient.setBufferSize(512);   // ← agregar esta línea
-  mqttClient.setKeepAlive(30);
-
-
-  xMutexDatos   = xSemaphoreCreateMutex();
-  datosSensores = { 0, 0, 0, 0, false, false, 0, 0, 0, 0, 0, 0, 0, false };
+  xMutexDatos = xSemaphoreCreateMutex();
+  datoZ1 = { 0, 0, 0, false, 0, 0, 0, 0, 0, 0, 0, false };
+  datoZ2 = { 0, 0, 0, false, 0, 0, 0, 0, 0, 0, 0, false };
 
   xTaskCreatePinnedToCore(tareaLecturaSensores, "TareaSensores", 8192, NULL, 2, &hTareaSensores, 0);
   xTaskCreatePinnedToCore(tareaMQTT,            "TareaMQTT",     8192, NULL, 1, &hTareaMQTT,     1);
@@ -202,92 +236,61 @@ void tareaLecturaSensores(void *pvParameters) {
   TickType_t xLastWake = xTaskGetTickCount();
 
   for (;;) {
+    DatosZona z1, z2;
+
     // DHT11
-    float temperatura     = dht.readTemperature();
-    float humedadAmbiente = dht.readHumidity();
+    z1.temperatura     = dht1.readTemperature();
+    z1.humedadAmbiente = dht1.readHumidity();
 
-    // Sensor de suelo — zona 1
-    int rawSueloZ1     = leerSueloPromedio(PIN_SUELO_Z1, ADC_MUESTRAS);
-    int humedadSueloZ1 = map(rawSueloZ1, SUELO_VALOR_SECO, SUELO_VALOR_HUMEDO, 0, 100);
-    humedadSueloZ1     = constrain(humedadSueloZ1, 0, 100);
+    // DHT22
+    z2.temperatura     = dht2.readTemperature();
+    z2.humedadAmbiente = dht2.readHumidity();
 
-    // Sensor de suelo — zona 2
-    int rawSueloZ2     = leerSueloPromedio(PIN_SUELO_Z2, ADC_MUESTRAS);
-    int humedadSueloZ2 = map(rawSueloZ2, SUELO_VALOR_SECO, SUELO_VALOR_HUMEDO, 0, 100);
-    humedadSueloZ2     = constrain(humedadSueloZ2, 0, 100);
+    // Humedad de suelo
+    int rawZ1       = leerSueloPromedio(PIN_SUELO_Z1, ADC_MUESTRAS);
+    z1.humedadSuelo = constrain(map(rawZ1, SUELO_VALOR_SECO, SUELO_VALOR_HUMEDO, 0, 100), 0, 100);
 
-    // Control válvula zona 1
-    if (humedadSueloZ1 <= SUELO_RIEGO_MIN) {
-      digitalWrite(PIN_VALVULA_1, HIGH);
-    } else if (humedadSueloZ1 >= SUELO_RIEGO_MAX) {
-      digitalWrite(PIN_VALVULA_1, LOW);
-    }
+    int rawZ2       = leerSueloPromedio(PIN_SUELO_Z2, ADC_MUESTRAS);
+    z2.humedadSuelo = constrain(map(rawZ2, SUELO_VALOR_SECO, SUELO_VALOR_HUMEDO, 0, 100), 0, 100);
 
-    // Control válvula zona 2
-    if (humedadSueloZ2 <= SUELO_RIEGO_MIN) {
-      digitalWrite(PIN_VALVULA_2, HIGH);
-    } else if (humedadSueloZ2 >= SUELO_RIEGO_MAX) {
-      digitalWrite(PIN_VALVULA_2, LOW);
-    }
+    // Control de válvulas
+    if (z1.humedadSuelo <= SUELO_RIEGO_MIN)      digitalWrite(PIN_VALVULA_Z1, HIGH);
+    else if (z1.humedadSuelo >= SUELO_RIEGO_MAX) digitalWrite(PIN_VALVULA_Z1, LOW);
 
-    bool valvulaZ1 = digitalRead(PIN_VALVULA_1);
-    bool valvulaZ2 = digitalRead(PIN_VALVULA_2);
+    if (z2.humedadSuelo <= SUELO_RIEGO_MIN)      digitalWrite(PIN_VALVULA_Z2, HIGH);
+    else if (z2.humedadSuelo >= SUELO_RIEGO_MAX) digitalWrite(PIN_VALVULA_Z2, LOW);
+
+    z1.valvula = digitalRead(PIN_VALVULA_Z1);
+    z2.valvula = digitalRead(PIN_VALVULA_Z2);
 
     // MQ-135
-    mq135.update();
+    leerMQ135(mq135_z1, z1);
+    leerMQ135(mq135_z2, z2);
 
-    mq135.setA(110.47); mq135.setB(-2.862);
-    float ppmCO2     = mq135.readSensor();
-
-    mq135.setA(605.18); mq135.setB(-3.937);
-    float ppmCO      = mq135.readSensor();
-
-    mq135.setA(102.2);  mq135.setB(-2.473);
-    float ppmNH3     = mq135.readSensor();
-
-    mq135.setA(77.255); mq135.setB(-3.18);
-    float ppmAlcohol = mq135.readSensor();
-
-    mq135.setA(3616.1); mq135.setB(-2.675);
-    float ppmHumo    = mq135.readSensor();
-
-    mq135.setA(44.947); mq135.setB(-3.445);
-    float ppmTolueno = mq135.readSensor();
-    mq135.setA(34.668); mq135.setB(-3.369);
-    float ppmAcetona = mq135.readSensor();
-
-    bool lecturaValida = !isnan(temperatura) && !isnan(humedadAmbiente) && ppmCO2 > 0;
+    z1.valido = !isnan(z1.temperatura) && !isnan(z1.humedadAmbiente) && z1.ppmCO2 > 0;
+    z2.valido = !isnan(z2.temperatura) && !isnan(z2.humedadAmbiente) && z2.ppmCO2 > 0;
 
     if (xSemaphoreTake(xMutexDatos, pdMS_TO_TICKS(100)) == pdTRUE) {
-      datosSensores.temperatura     = temperatura;
-      datosSensores.humedadAmbiente = humedadAmbiente;
-      datosSensores.humedadSueloZ1  = humedadSueloZ1;
-      datosSensores.humedadSueloZ2  = humedadSueloZ2;
-      datosSensores.valvulaZ1       = valvulaZ1;
-      datosSensores.valvulaZ2       = valvulaZ2;
-      datosSensores.ppmCO2          = ppmCO2;
-      datosSensores.ppmCO           = ppmCO;
-      datosSensores.ppmNH3          = ppmNH3;
-      datosSensores.ppmAlcohol      = ppmAlcohol;
-      datosSensores.ppmHumo         = ppmHumo;
-      datosSensores.ppmTolueno      = ppmTolueno;
-      datosSensores.ppmAcetona      = ppmAcetona;
-      datosSensores.valido          = lecturaValida;
+      datoZ1 = z1;
+      datoZ2 = z2;
       xSemaphoreGive(xMutexDatos);
     }
 
-    Serial.println("--- Lectura sensores ---");
-    Serial.printf("  Temperatura:      %.1f C\n",             temperatura);
-    Serial.printf("  Humedad ambiente: %.1f %%\n",            humedadAmbiente);
-    Serial.printf("  Suelo zona 1:     %d %%  Valvula: %s\n", humedadSueloZ1, valvulaZ1 ? "ABIERTA" : "CERRADA");
-    Serial.printf("  Suelo zona 2:     %d %%  Valvula: %s\n", humedadSueloZ2, valvulaZ2 ? "ABIERTA" : "CERRADA");
-    Serial.printf("  CO2:              %.1f ppm\n",           ppmCO2);
-    Serial.printf("  CO:               %.1f ppm\n",           ppmCO);
-    Serial.printf("  NH3:              %.1f ppm\n",           ppmNH3);
-    Serial.printf("  Alcohol:          %.1f ppm\n",           ppmAlcohol);
-    Serial.printf("  Humo:             %.1f ppm\n",           ppmHumo);
-    Serial.printf("  Tolueno:          %.1f ppm\n",           ppmTolueno);
-    Serial.printf("  Acetona:          %.1f ppm\n",           ppmAcetona);
+    // Serial — zona 1
+    Serial.println("--- Zona 1 ---");
+    Serial.printf("  Temperatura:      %.1f C\n",  z1.temperatura);
+    Serial.printf("  Humedad ambiente: %.1f %%\n", z1.humedadAmbiente);
+    Serial.printf("  Suelo:            %d %%  Valvula: %s\n", z1.humedadSuelo, z1.valvula ? "ABIERTA" : "CERRADA");
+    Serial.printf("  CO2: %.1f  CO: %.1f  NH3: %.1f  Alcohol: %.1f  Humo: %.1f  Tolueno: %.1f  Acetona: %.1f (ppm)\n",
+      z1.ppmCO2, z1.ppmCO, z1.ppmNH3, z1.ppmAlcohol, z1.ppmHumo, z1.ppmTolueno, z1.ppmAcetona);
+
+    // Serial — zona 2
+    Serial.println("--- Zona 2 ---");
+    Serial.printf("  Temperatura:      %.1f C\n",  z2.temperatura);
+    Serial.printf("  Humedad ambiente: %.1f %%\n", z2.humedadAmbiente);
+    Serial.printf("  Suelo:            %d %%  Valvula: %s\n", z2.humedadSuelo, z2.valvula ? "ABIERTA" : "CERRADA");
+    Serial.printf("  CO2: %.1f  CO: %.1f  NH3: %.1f  Alcohol: %.1f  Humo: %.1f  Tolueno: %.1f  Acetona: %.1f (ppm)\n",
+      z2.ppmCO2, z2.ppmCO, z2.ppmNH3, z2.ppmAlcohol, z2.ppmHumo, z2.ppmTolueno, z2.ppmAcetona);
 
     vTaskDelayUntil(&xLastWake, pdMS_TO_TICKS(INTERVALO_SENSORES_MS));
   }
@@ -303,30 +306,45 @@ void tareaMQTT(void *pvParameters) {
     if (!mqttClient.connected()) conectarMQTT();
     mqttClient.loop();
 
-    DatosSensores datos;
+    DatosZona z1, z2;
     if (xSemaphoreTake(xMutexDatos, pdMS_TO_TICKS(100)) == pdTRUE) {
-      datos = datosSensores;
+      z1 = datoZ1;
+      z2 = datoZ2;
       xSemaphoreGive(xMutexDatos);
     } else {
       vTaskDelayUntil(&xLastWake, pdMS_TO_TICKS(INTERVALO_MQTT_MS));
       continue;
     }
 
-    if (!datos.valido) {
-      mqttClient.publish(TOPIC_ALERTAS.c_str(), "ERROR: Fallo en lectura de sensores");
+    if (!z1.valido && !z2.valido) {
+      mqttClient.publish(TOPIC_ALERTAS.c_str(), "ERROR: Fallo en lectura de ambas zonas");
       vTaskDelayUntil(&xLastWake, pdMS_TO_TICKS(INTERVALO_MQTT_MS));
       continue;
     }
 
-    String json = construirJSON(datos);
+    // JSON único con ambas zonas
+    String json = construirJSONCompleto(z1, z2);
     mqttClient.publish(TOPIC_ESTADO.c_str(), json.c_str());
 
+    // Alertas por zona
     String alerta = "";
-    alerta += evaluarTemperatura(datos.temperatura);
-    alerta += evaluarHumedadAmbiente(datos.humedadAmbiente);
-    alerta += evaluarHumedadSuelo(datos.humedadSueloZ1, 1);
-    alerta += evaluarHumedadSuelo(datos.humedadSueloZ2, 2);
-    alerta += evaluarCalidadAire(datos.ppmCO2);
+    if (z1.valido) {
+      alerta += evaluarTemperatura(z1.temperatura, 1);
+      alerta += evaluarHumedadAmbiente(z1.humedadAmbiente, 1);
+      alerta += evaluarHumedadSuelo(z1.humedadSuelo, 1);
+      alerta += evaluarCalidadAire(z1.ppmCO2, 1);
+    } else {
+      alerta += "CRITICA|zona1|Fallo en lectura de sensores\n";
+    }
+
+    if (z2.valido) {
+      alerta += evaluarTemperatura(z2.temperatura, 2);
+      alerta += evaluarHumedadAmbiente(z2.humedadAmbiente, 2);
+      alerta += evaluarHumedadSuelo(z2.humedadSuelo, 2);
+      alerta += evaluarCalidadAire(z2.ppmCO2, 2);
+    } else {
+      alerta += "CRITICA|zona2|Fallo en lectura de sensores\n";
+    }
 
     if (alerta.length() > 0) {
       mqttClient.publish(TOPIC_ALERTAS.c_str(), alerta.c_str());
@@ -380,79 +398,69 @@ void conectarMQTT() {
   }
 }
 
-// Evaluaciones — DHT11
-String evaluarTemperatura(float t) {
-  if (isnan(t))         return "CRITICA|temperatura|Error de lectura DHT11\n";
-  if (t > TEMP_CRITICA) return "CRITICA|temperatura|Mayor a 35C - activar extractor\n";
-  if (t > TEMP_OPT_MAX) return "ADVERTENCIA|temperatura|Alta (28-35C) - revisar ventilacion\n";
-  if (t < TEMP_OPT_MIN) return "AVISO|temperatura|Baja (<22C) - considerar calefaccion\n";
+// Evaluaciones
+String evaluarTemperatura(float t, int zona) {
+  String z = "|zona" + String(zona) + "_temp|";
+  if (isnan(t))         return "CRITICA"     + z + "Error de lectura DHT11\n";
+  if (t > TEMP_CRITICA) return "CRITICA"     + z + "Mayor a 35C - activar extractor\n";
+  if (t > TEMP_OPT_MAX) return "ADVERTENCIA" + z + "Alta (28-35C) - revisar ventilacion\n";
+  if (t < TEMP_OPT_MIN) return "AVISO"       + z + "Baja (<22C) - considerar calefaccion\n";
   return "";
 }
 
-String evaluarHumedadAmbiente(float h) {
-  if (isnan(h))            return "CRITICA|hum_ambiente|Error de lectura DHT11\n";
-  if (h > HUM_AMB_CRITICA) return "CRITICA|hum_ambiente|Mayor a 90% - riesgo de hongos, activar extractor\n";
-  if (h > HUM_AMB_OPT_MAX) return "ADVERTENCIA|hum_ambiente|Alta (80-90%) - aumentar ventilacion\n";
-  if (h < HUM_AMB_OPT_MIN) return "AVISO|hum_ambiente|Baja (<60%) - revisar nebulizacion\n";
+String evaluarHumedadAmbiente(float h, int zona) {
+  String z = "|zona" + String(zona) + "_hum_amb|";
+  if (isnan(h))             return "CRITICA"     + z + "Error de lectura DHT11\n";
+  if (h > HUM_AMB_CRITICA)  return "CRITICA"     + z + "Mayor a 90% - riesgo de hongos, activar extractor\n";
+  if (h > HUM_AMB_OPT_MAX)  return "ADVERTENCIA" + z + "Alta (80-90%) - aumentar ventilacion\n";
+  if (h < HUM_AMB_OPT_MIN)  return "AVISO"       + z + "Baja (<60%) - revisar nebulizacion\n";
   return "";
 }
 
-// Evaluaciones — suelo por zona
 String evaluarHumedadSuelo(int s, int zona) {
-  String z = "zona" + String(zona);
-  if (s < SUELO_CRITICO)   return "CRITICA|hum_suelo_"     + z + "|Menor a 40% - riego urgente\n";
-  if (s < SUELO_RIEGO_MIN) return "ADVERTENCIA|hum_suelo_" + z + "|Baja (40-60%) - valvula abierta\n";
-  if (s > SUELO_RIEGO_MAX) return "ADVERTENCIA|hum_suelo_" + z + "|Exceso (>80%) - valvula cerrada\n";
+  String z = "|zona" + String(zona) + "_hum_suelo|";
+  if (s < SUELO_CRITICO)   return "CRITICA"     + z + "Menor a 40% - riego urgente\n";
+  if (s < SUELO_RIEGO_MIN) return "ADVERTENCIA" + z + "Baja (40-60%) - valvula abierta\n";
+  if (s > SUELO_RIEGO_MAX) return "ADVERTENCIA" + z + "Exceso (>80%) - valvula cerrada\n";
   return "";
 }
 
-// Evaluaciones — MQ-135
-String evaluarCalidadAire(float co2ppm) {
-  if (co2ppm > CO2_CRITICO)     return "CRITICA|co2|Mayor a 5000 ppm - activar ventilacion urgente\n";
-  if (co2ppm > CO2_ADVERTENCIA) return "ADVERTENCIA|co2|Alta (2000-5000 ppm) - aumentar ventilacion\n";
-  if (co2ppm > CO2_OPTIMO)      return "AVISO|co2|Sobre nivel optimo (>1200 ppm)\n";
+String evaluarCalidadAire(float co2ppm, int zona) {
+  String z = "|zona" + String(zona) + "_co2|";
+  if (co2ppm > CO2_CRITICO)     return "CRITICA"     + z + "Mayor a 5000 ppm - activar ventilacion urgente\n";
+  if (co2ppm > CO2_ADVERTENCIA) return "ADVERTENCIA" + z + "Alta (2000-5000 ppm) - aumentar ventilacion\n";
+  if (co2ppm > CO2_OPTIMO)      return "AVISO"       + z + "Sobre nivel optimo (>1200 ppm)\n";
   return "";
 }
 
-// JSON de estado completo
-String construirJSON(const DatosSensores &d) {
-  String estadoTemp    = (d.temperatura > TEMP_CRITICA)  ? "critica"     :
-                         (d.temperatura > TEMP_OPT_MAX)  ? "advertencia" :
-                         (d.temperatura < TEMP_OPT_MIN)  ? "baja"        : "optima";
+// JSON por zona
+String construirJSONZona(const DatosZona &d, int zona) {
+  String estadoTemp   = (d.temperatura > TEMP_CRITICA)        ? "critica"     :
+                        (d.temperatura > TEMP_OPT_MAX)        ? "advertencia" :
+                        (d.temperatura < TEMP_OPT_MIN)        ? "baja"        : "optima";
 
-  String estadoHumAmb  = (d.humedadAmbiente > HUM_AMB_CRITICA) ? "critica"     :
-                         (d.humedadAmbiente > HUM_AMB_OPT_MAX) ? "advertencia" :
-                         (d.humedadAmbiente < HUM_AMB_OPT_MIN) ? "baja"        : "optima";
+  String estadoHumAmb = (d.humedadAmbiente > HUM_AMB_CRITICA) ? "critica"     :
+                        (d.humedadAmbiente > HUM_AMB_OPT_MAX) ? "advertencia" :
+                        (d.humedadAmbiente < HUM_AMB_OPT_MIN) ? "baja"        : "optima";
 
-  String estadoSueloZ1 = (d.humedadSueloZ1 < SUELO_CRITICO)  ? "critica" :
-                         (d.humedadSueloZ1 < SUELO_RIEGO_MIN) ? "riego"   :
-                         (d.humedadSueloZ1 > SUELO_RIEGO_MAX) ? "exceso"  : "optima";
+  String estadoSuelo  = (d.humedadSuelo < SUELO_CRITICO)      ? "critica" :
+                        (d.humedadSuelo < SUELO_RIEGO_MIN)     ? "riego"   :
+                        (d.humedadSuelo > SUELO_RIEGO_MAX)     ? "exceso"  : "optima";
 
-  String estadoSueloZ2 = (d.humedadSueloZ2 < SUELO_CRITICO)  ? "critica" :
-                         (d.humedadSueloZ2 < SUELO_RIEGO_MIN) ? "riego"   :
-                         (d.humedadSueloZ2 > SUELO_RIEGO_MAX) ? "exceso"  : "optima";
+  String estadoCO2    = (d.ppmCO2 > CO2_CRITICO)              ? "critica"     :
+                        (d.ppmCO2 > CO2_ADVERTENCIA)           ? "advertencia" :
+                        (d.ppmCO2 > CO2_OPTIMO)                ? "aviso"       : "optima";
 
-  String estadoCO2     = (d.ppmCO2 > CO2_CRITICO)    ? "critica"     :
-                         (d.ppmCO2 > CO2_ADVERTENCIA) ? "advertencia" :
-                         (d.ppmCO2 > CO2_OPTIMO)      ? "aviso"       : "optima";
-
-  char json[1024];
-  snprintf(json, sizeof(json),
+  char buf[768];
+  snprintf(buf, sizeof(buf),
     "{"
       "\"temperatura\":%.1f,"
       "\"temp_estado\":\"%s\","
       "\"hum_ambiente\":%.1f,"
       "\"hum_amb_estado\":\"%s\","
-      "\"zona1\":{"
-        "\"hum_suelo\":%d,"
-        "\"suelo_estado\":\"%s\","
-        "\"valvula\":\"%s\""
-      "},"
-      "\"zona2\":{"
-        "\"hum_suelo\":%d,"
-        "\"suelo_estado\":\"%s\","
-        "\"valvula\":\"%s\""
-      "},"
+      "\"hum_suelo\":%d,"
+      "\"suelo_estado\":\"%s\","
+      "\"valvula\":\"%s\","
       "\"co2_ppm\":%.1f,"
       "\"co2_estado\":\"%s\","
       "\"co_ppm\":%.1f,"
@@ -464,8 +472,8 @@ String construirJSON(const DatosSensores &d) {
     "}",
     d.temperatura,     estadoTemp.c_str(),
     d.humedadAmbiente, estadoHumAmb.c_str(),
-    d.humedadSueloZ1,  estadoSueloZ1.c_str(), d.valvulaZ1 ? "ABIERTA" : "CERRADA",
-    d.humedadSueloZ2,  estadoSueloZ2.c_str(), d.valvulaZ2 ? "ABIERTA" : "CERRADA",
+    d.humedadSuelo,    estadoSuelo.c_str(),
+    d.valvula ? "ABIERTA" : "CERRADA",
     d.ppmCO2,          estadoCO2.c_str(),
     d.ppmCO,
     d.ppmNH3,
@@ -475,5 +483,12 @@ String construirJSON(const DatosSensores &d) {
     d.ppmAcetona
   );
 
-  return String(json);
+  return String(buf);
+}
+
+// JSON raíz con ambas zonas
+String construirJSONCompleto(const DatosZona &z1, const DatosZona &z2) {
+  String j1 = construirJSONZona(z1, 1);
+  String j2 = construirJSONZona(z2, 2);
+  return "{\"zona1\":" + j1 + ",\"zona2\":" + j2 + "}";
 }
