@@ -6,6 +6,7 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <MQUnifiedsensor.h>
+#include <ArduinoJson.h>
 
 // WiFi y MQTT
 #define WIFI_SSID       "SRAI"
@@ -20,13 +21,14 @@
 // Tópicos MQTT
 String TOPIC_ALERTAS;
 String TOPIC_ESTADO;
+String TOPIC_CMD;     // topico de comandos
 
 // Pines — zona 1
 #define DHTPIN_Z1       4
 #define PIN_MQ135_Z1    32
 #define PIN_SUELO_Z1    34
 #define PIN_VALVULA_Z1  26
-#define DHTTYPE_Z1         DHT11
+#define DHTTYPE_Z1         DHT22
 
 // Pines — zona 2
 #define DHTPIN_Z2       16
@@ -67,9 +69,10 @@ const float CO2_CRITICO      = 5000.0;
 // ADC
 #define ADC_MUESTRAS        16
 
-// Intervalos de tareas
-#define INTERVALO_SENSORES_MS  60000
-#define INTERVALO_MQTT_MS      60000
+// Intervalos de tareas (ms)
+#define INTERVALO_SENSORES_MS   60000   // cada minuto
+#define INTERVALO_MQTT_LOOP_MS    100
+
 
 // Objetos globales
 DHT dht1(DHTPIN_Z1, DHTTYPE_Z1);
@@ -102,6 +105,12 @@ DatosZona datoZ2;
 
 SemaphoreHandle_t xMutexDatos;
 
+// control manual de valvulas
+bool modoManualZ1 = false;
+bool modoManualZ2 = false;
+bool cmdValvulaZ1 = false;
+bool cmdValvulaZ2 = false;
+
 // Handles FreeRTOS
 TaskHandle_t hTareaSensores = NULL;
 TaskHandle_t hTareaMQTT     = NULL;
@@ -113,6 +122,7 @@ void   leerMQ135(MQUnifiedsensor &sensor, DatosZona &zona);
 int    leerSueloPromedio(int pin, int muestras);
 void   tareaLecturaSensores(void *pvParameters);
 void   tareaMQTT(void *pvParameters);
+void   publicarEstadoYAlertas();
 void   conectarWiFi();
 void   conectarMQTT();
 String evaluarTemperatura(float t, int zona);
@@ -127,6 +137,61 @@ void iniciarTopicos() {
   String base   = String("invernadero/jitomate/") + MQTT_CLIENT_ID;
   TOPIC_ALERTAS = base + "/alertas";
   TOPIC_ESTADO  = base + "/estado";
+  TOPIC_CMD     = base + "/cmd";
+}
+
+// callback de comandos MQTT
+void callbackMQTT(char* topic, byte* payload, unsigned int length) {
+  StaticJsonDocument<128> doc;
+  DeserializationError err = deserializeJson(doc, payload, length);
+  if (err) {
+    Serial.printf("[CMD] JSON invalido: %s\n", err.c_str());
+    return;
+  }
+
+  if (!doc.containsKey("zona")) {
+    Serial.println("[CMD] Falta campo zona");
+    return;
+  }
+  int zona = doc["zona"].as<int>();
+  if (zona != 1 && zona != 2) {
+    Serial.printf("[CMD] Zona invalida: %d\n", zona);
+    return;
+  }
+
+  const char* modo = doc["modo"] | "";
+  if (strcmp(modo, "auto") == 0) {
+    if (xSemaphoreTake(xMutexDatos, pdMS_TO_TICKS(200)) == pdTRUE) {
+      if (zona == 1) modoManualZ1 = false;
+      else           modoManualZ2 = false;
+      xSemaphoreGive(xMutexDatos);
+    }
+    Serial.printf("[CMD] Zona %d -> AUTOMATICO\n", zona);
+    return;
+  }
+
+  if (!doc.containsKey("valvula")) {
+    Serial.println("[CMD] Falta campo valvula/modo");
+    return;
+  }
+  bool abrir = doc["valvula"].as<bool>();
+
+  if (xSemaphoreTake(xMutexDatos, pdMS_TO_TICKS(200)) == pdTRUE) {
+    if (zona == 1) {
+      modoManualZ1 = true;
+      cmdValvulaZ1 = abrir;
+      digitalWrite(PIN_VALVULA_Z1, abrir ? HIGH : LOW);
+      datoZ1.valvula = abrir;
+    } else {
+      modoManualZ2 = true;
+      cmdValvulaZ2 = abrir;
+      digitalWrite(PIN_VALVULA_Z2, abrir ? HIGH : LOW);
+      datoZ2.valvula = abrir;
+    }
+    xSemaphoreGive(xMutexDatos);
+  }
+
+  Serial.printf("[CMD] Zona %d -> MANUAL, valvula %s\n", zona, abrir ? "ABIERTA" : "CERRADA");
 }
 
 // Calibración R0 — recibe el sensor por referencia
@@ -212,6 +277,7 @@ void setup() {
   conectarWiFi();
 
   mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+  mqttClient.setCallback(callbackMQTT);
   mqttClient.setBufferSize(1024);
   mqttClient.setKeepAlive(30);
 
@@ -245,7 +311,9 @@ void tareaLecturaSensores(void *pvParameters) {
     // DHT22
     z2.temperatura     = dht2.readTemperature();
     z2.humedadAmbiente = dht2.readHumidity();
-
+    // Valores fijos de prueba
+    //z2.temperatura     = 27.1;
+    //z2.humedadAmbiente = 52.0;
     // Humedad de suelo
     int rawZ1       = leerSueloPromedio(PIN_SUELO_Z1, ADC_MUESTRAS);
     z1.humedadSuelo = constrain(map(rawZ1, SUELO_VALOR_SECO, SUELO_VALOR_HUMEDO, 0, 100), 0, 100);
@@ -253,12 +321,29 @@ void tareaLecturaSensores(void *pvParameters) {
     int rawZ2       = leerSueloPromedio(PIN_SUELO_Z2, ADC_MUESTRAS);
     z2.humedadSuelo = constrain(map(rawZ2, SUELO_VALOR_SECO, SUELO_VALOR_HUMEDO, 0, 100), 0, 100);
 
-    // Control de válvulas
-    if (z1.humedadSuelo <= SUELO_RIEGO_MIN)      digitalWrite(PIN_VALVULA_Z1, HIGH);
-    else if (z1.humedadSuelo >= SUELO_RIEGO_MAX) digitalWrite(PIN_VALVULA_Z1, LOW);
+    bool manualZ1 = false, manualZ2 = false, cmdZ1 = false, cmdZ2 = false;
+    if (xSemaphoreTake(xMutexDatos, pdMS_TO_TICKS(100)) == pdTRUE) {
+      manualZ1 = modoManualZ1; cmdZ1 = cmdValvulaZ1;
+      manualZ2 = modoManualZ2; cmdZ2 = cmdValvulaZ2;
+      xSemaphoreGive(xMutexDatos);
+    }
 
-    if (z2.humedadSuelo <= SUELO_RIEGO_MIN)      digitalWrite(PIN_VALVULA_Z2, HIGH);
-    else if (z2.humedadSuelo >= SUELO_RIEGO_MAX) digitalWrite(PIN_VALVULA_Z2, LOW);
+    // control de valvulas
+    if (manualZ1) {
+      digitalWrite(PIN_VALVULA_Z1, cmdZ1 ? HIGH : LOW);
+    } else if (z1.humedadSuelo <= SUELO_RIEGO_MIN) {
+      digitalWrite(PIN_VALVULA_Z1, HIGH);
+    } else if (z1.humedadSuelo >= SUELO_RIEGO_MAX) {
+      digitalWrite(PIN_VALVULA_Z1, LOW);
+    }
+
+    if (manualZ2) {
+      digitalWrite(PIN_VALVULA_Z2, cmdZ2 ? HIGH : LOW);
+    } else if (z2.humedadSuelo <= SUELO_RIEGO_MIN) {
+      digitalWrite(PIN_VALVULA_Z2, HIGH);
+    } else if (z2.humedadSuelo >= SUELO_RIEGO_MAX) {
+      digitalWrite(PIN_VALVULA_Z2, LOW);
+    }
 
     z1.valvula = digitalRead(PIN_VALVULA_Z1);
     z2.valvula = digitalRead(PIN_VALVULA_Z2);
@@ -266,6 +351,14 @@ void tareaLecturaSensores(void *pvParameters) {
     // MQ-135
     leerMQ135(mq135_z1, z1);
     leerMQ135(mq135_z2, z2);
+        // Valores fijos de prueba — zona 2
+   // z2.ppmCO2     = 800.0;
+   // z2.ppmCO      = 1.5;
+   // z2.ppmNH3     = 2.0;
+   // z2.ppmAlcohol = 0.5;
+   // z2.ppmHumo    = 3.0;
+   // z2.ppmTolueno = 0.8;
+   // z2.ppmAcetona = 1.2;
 
     z1.valido = !isnan(z1.temperatura) && !isnan(z1.humedadAmbiente) && z1.ppmCO2 > 0;
     z2.valido = !isnan(z2.temperatura) && !isnan(z2.humedadAmbiente) && z2.ppmCO2 > 0;
@@ -275,6 +368,9 @@ void tareaLecturaSensores(void *pvParameters) {
       datoZ2 = z2;
       xSemaphoreGive(xMutexDatos);
     }
+
+    // notifica a la tarea MQTT
+    if (hTareaMQTT != NULL) xTaskNotifyGive(hTareaMQTT);
 
     // Serial — zona 1
     Serial.println("--- Zona 1 ---");
@@ -296,63 +392,60 @@ void tareaLecturaSensores(void *pvParameters) {
   }
 }
 
-// Tarea 2 — MQTT (núcleo 1)
+// Tarea 2 — MQTT (nucleo 1)
 void tareaMQTT(void *pvParameters) {
-  TickType_t xLastWake = xTaskGetTickCount();
-
   conectarMQTT();
 
   for (;;) {
     if (!mqttClient.connected()) conectarMQTT();
     mqttClient.loop();
 
-    DatosZona z1, z2;
-    if (xSemaphoreTake(xMutexDatos, pdMS_TO_TICKS(100)) == pdTRUE) {
-      z1 = datoZ1;
-      z2 = datoZ2;
-      xSemaphoreGive(xMutexDatos);
-    } else {
-      vTaskDelayUntil(&xLastWake, pdMS_TO_TICKS(INTERVALO_MQTT_MS));
-      continue;
+    if (ulTaskNotifyTake(pdTRUE, 0) > 0) {
+      publicarEstadoYAlertas();
     }
 
-    if (!z1.valido && !z2.valido) {
-      mqttClient.publish(TOPIC_ALERTAS.c_str(), "ERROR: Fallo en lectura de ambas zonas");
-      vTaskDelayUntil(&xLastWake, pdMS_TO_TICKS(INTERVALO_MQTT_MS));
-      continue;
-    }
+    vTaskDelay(pdMS_TO_TICKS(INTERVALO_MQTT_LOOP_MS));
+  }
+}
 
-    // JSON único con ambas zonas
-    String json = construirJSONCompleto(z1, z2);
-    mqttClient.publish(TOPIC_ESTADO.c_str(), json.c_str());
+// Lee el último dato compartido y publica estado + alertas por MQTT
+void publicarEstadoYAlertas() {
+  DatosZona z1, z2;
+  if (xSemaphoreTake(xMutexDatos, pdMS_TO_TICKS(100)) == pdTRUE) {
+    z1 = datoZ1;
+    z2 = datoZ2;
+    xSemaphoreGive(xMutexDatos);
+  } else {
+    return;
+  }
 
-    // Alertas por zona
-    String alerta = "";
-    if (z1.valido) {
-      alerta += evaluarTemperatura(z1.temperatura, 1);
-      alerta += evaluarHumedadAmbiente(z1.humedadAmbiente, 1);
-      alerta += evaluarHumedadSuelo(z1.humedadSuelo, 1);
-      alerta += evaluarCalidadAire(z1.ppmCO2, 1);
-    } else {
-      alerta += "CRITICA|zona1|Fallo en lectura de sensores\n";
-    }
+  String json = construirJSONCompleto(z1, z2);
+  mqttClient.publish(TOPIC_ESTADO.c_str(), json.c_str());
 
-    if (z2.valido) {
-      alerta += evaluarTemperatura(z2.temperatura, 2);
-      alerta += evaluarHumedadAmbiente(z2.humedadAmbiente, 2);
-      alerta += evaluarHumedadSuelo(z2.humedadSuelo, 2);
-      alerta += evaluarCalidadAire(z2.ppmCO2, 2);
-    } else {
-      alerta += "CRITICA|zona2|Fallo en lectura de sensores\n";
-    }
+  // Alertas por zona
+  String alerta = "";
+  if (z1.valido) {
+    alerta += evaluarTemperatura(z1.temperatura, 1);
+    alerta += evaluarHumedadAmbiente(z1.humedadAmbiente, 1);
+    alerta += evaluarHumedadSuelo(z1.humedadSuelo, 1);
+    alerta += evaluarCalidadAire(z1.ppmCO2, 1);
+  } else {
+    alerta += "CRITICA|zona1|Fallo en lectura de sensores\n";
+  }
 
-    if (alerta.length() > 0) {
-      mqttClient.publish(TOPIC_ALERTAS.c_str(), alerta.c_str());
-      Serial.println("Alertas publicadas:");
-      Serial.println(alerta);
-    }
+  if (z2.valido) {
+    alerta += evaluarTemperatura(z2.temperatura, 2);
+    alerta += evaluarHumedadAmbiente(z2.humedadAmbiente, 2);
+    alerta += evaluarHumedadSuelo(z2.humedadSuelo, 2);
+    alerta += evaluarCalidadAire(z2.ppmCO2, 2);
+  } else {
+    alerta += "CRITICA|zona2|Fallo en lectura de sensores\n";
+  }
 
-    vTaskDelayUntil(&xLastWake, pdMS_TO_TICKS(INTERVALO_MQTT_MS));
+  if (alerta.length() > 0) {
+    mqttClient.publish(TOPIC_ALERTAS.c_str(), alerta.c_str());
+    Serial.println("Alertas publicadas:");
+    Serial.println(alerta);
   }
 }
 
@@ -390,6 +483,8 @@ void conectarMQTT() {
     if (conectado) {
       Serial.println(" OK");
       mqttClient.publish(TOPIC_ESTADO.c_str(), "{\"evento\":\"online\",\"dispositivo\":\"ESP32_zona_1\"}");
+      mqttClient.subscribe(TOPIC_CMD.c_str());
+      Serial.printf("Suscrito a: %s\n", TOPIC_CMD.c_str());
     } else {
       Serial.printf(" Error: estado=%d. Reintentando en 3 s...\n", mqttClient.state());
       vTaskDelay(pdMS_TO_TICKS(3000));
@@ -433,13 +528,20 @@ String evaluarCalidadAire(float co2ppm, int zona) {
   return "";
 }
 
+// NaN se serializa como null
+static String numOrNull(float v, int dec) {
+  return isnan(v) ? String("null") : String(v, dec);
+}
+
 // JSON por zona
 String construirJSONZona(const DatosZona &d, int zona) {
-  String estadoTemp   = (d.temperatura > TEMP_CRITICA)        ? "critica"     :
+  String estadoTemp   = isnan(d.temperatura)                  ? "sin_dato"    :
+                        (d.temperatura > TEMP_CRITICA)        ? "critica"     :
                         (d.temperatura > TEMP_OPT_MAX)        ? "advertencia" :
                         (d.temperatura < TEMP_OPT_MIN)        ? "baja"        : "optima";
 
-  String estadoHumAmb = (d.humedadAmbiente > HUM_AMB_CRITICA) ? "critica"     :
+  String estadoHumAmb = isnan(d.humedadAmbiente)              ? "sin_dato"    :
+                        (d.humedadAmbiente > HUM_AMB_CRITICA) ? "critica"     :
                         (d.humedadAmbiente > HUM_AMB_OPT_MAX) ? "advertencia" :
                         (d.humedadAmbiente < HUM_AMB_OPT_MIN) ? "baja"        : "optima";
 
@@ -447,43 +549,29 @@ String construirJSONZona(const DatosZona &d, int zona) {
                         (d.humedadSuelo < SUELO_RIEGO_MIN)     ? "riego"   :
                         (d.humedadSuelo > SUELO_RIEGO_MAX)     ? "exceso"  : "optima";
 
-  String estadoCO2    = (d.ppmCO2 > CO2_CRITICO)              ? "critica"     :
+  String estadoCO2    = isnan(d.ppmCO2)                       ? "sin_dato"    :
+                        (d.ppmCO2 > CO2_CRITICO)              ? "critica"     :
                         (d.ppmCO2 > CO2_ADVERTENCIA)           ? "advertencia" :
                         (d.ppmCO2 > CO2_OPTIMO)                ? "aviso"       : "optima";
 
-  char buf[768];
-  snprintf(buf, sizeof(buf),
-    "{"
-      "\"temperatura\":%.1f,"
-      "\"temp_estado\":\"%s\","
-      "\"hum_ambiente\":%.1f,"
-      "\"hum_amb_estado\":\"%s\","
-      "\"hum_suelo\":%d,"
-      "\"suelo_estado\":\"%s\","
-      "\"valvula\":\"%s\","
-      "\"co2_ppm\":%.1f,"
-      "\"co2_estado\":\"%s\","
-      "\"co_ppm\":%.1f,"
-      "\"nh3_ppm\":%.1f,"
-      "\"alcohol_ppm\":%.1f,"
-      "\"humo_ppm\":%.1f,"
-      "\"tolueno_ppm\":%.1f,"
-      "\"acetona_ppm\":%.1f"
-    "}",
-    d.temperatura,     estadoTemp.c_str(),
-    d.humedadAmbiente, estadoHumAmb.c_str(),
-    d.humedadSuelo,    estadoSuelo.c_str(),
-    d.valvula ? "ABIERTA" : "CERRADA",
-    d.ppmCO2,          estadoCO2.c_str(),
-    d.ppmCO,
-    d.ppmNH3,
-    d.ppmAlcohol,
-    d.ppmHumo,
-    d.ppmTolueno,
-    d.ppmAcetona
-  );
-
-  return String(buf);
+  String json = "{";
+  json += "\"temperatura\":"      + numOrNull(d.temperatura, 1)     + ",";
+  json += "\"temp_estado\":\""    + estadoTemp                      + "\",";
+  json += "\"hum_ambiente\":"     + numOrNull(d.humedadAmbiente, 1) + ",";
+  json += "\"hum_amb_estado\":\"" + estadoHumAmb                    + "\",";
+  json += "\"hum_suelo\":"        + String(d.humedadSuelo)          + ",";
+  json += "\"suelo_estado\":\""   + estadoSuelo                     + "\",";
+  json += "\"valvula\":\""        + String(d.valvula ? "ABIERTA" : "CERRADA") + "\",";
+  json += "\"co2_ppm\":"          + numOrNull(d.ppmCO2, 1)          + ",";
+  json += "\"co2_estado\":\""     + estadoCO2                       + "\",";
+  json += "\"co_ppm\":"           + numOrNull(d.ppmCO, 1)           + ",";
+  json += "\"nh3_ppm\":"          + numOrNull(d.ppmNH3, 1)          + ",";
+  json += "\"alcohol_ppm\":"      + numOrNull(d.ppmAlcohol, 1)      + ",";
+  json += "\"humo_ppm\":"         + numOrNull(d.ppmHumo, 1)         + ",";
+  json += "\"tolueno_ppm\":"      + numOrNull(d.ppmTolueno, 1)      + ",";
+  json += "\"acetona_ppm\":"      + numOrNull(d.ppmAcetona, 1);
+  json += "}";
+  return json;
 }
 
 // JSON raíz con ambas zonas
